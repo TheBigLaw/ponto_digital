@@ -65,29 +65,46 @@
       return obj;
     }
     async function fbList(col) {
+      var all = [];
+      var pageToken = null;
       try {
-        const r = await fetch(FB + "/" + col + "?key=" + API_KEY + "&pageSize=5000");
-        if (!r.ok) throw new Error(r.statusText);
-        const d = await r.json(); return (d.documents || []).map(fromFirestore);
+        do {
+          var url = FB + "/" + col + "?key=" + API_KEY + "&pageSize=5000";
+          if (pageToken) url += "&pageToken=" + pageToken;
+          var r = await fetch(url);
+          if (!r.ok) throw new Error(r.statusText);
+          var d = await r.json();
+          all = all.concat((d.documents || []).map(fromFirestore));
+          pageToken = d.nextPageToken || null;
+        } while (pageToken);
+        return all;
       } catch (e) { console.error("fbList:", e); return []; }
     }
     async function fbCreate(col, data, customId) {
-      try {
-        const url = customId ? FB+"/"+col+"?documentId="+customId+"&key="+API_KEY : FB+"/"+col+"?key="+API_KEY;
-        const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(toFirestore(data)) });
-        if (!r.ok) throw new Error(r.statusText); return fromFirestore(await r.json());
-      } catch (e) { console.error("fbCreate:", e); return null; }
+      const url = customId ? FB+"/"+col+"?documentId="+customId+"&key="+API_KEY : FB+"/"+col+"?key="+API_KEY;
+      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(toFirestore(data)) });
+      if (!r.ok) {
+        var errText = await r.text().catch(function() { return r.statusText; });
+        throw new Error("Erro ao salvar: " + errText);
+      }
+      return fromFirestore(await r.json());
     }
     async function fbUpdate(col, docId, data) {
-      try {
-        const mask = Object.keys(data).filter(function(k){return k!=="id";}).map(function(k){return "updateMask.fieldPaths="+k;}).join("&");
-        const r = await fetch(FB+"/"+col+"/"+docId+"?"+mask+"&key="+API_KEY, { method: "PATCH", headers: {"Content-Type":"application/json"}, body: JSON.stringify(toFirestore(data)) });
-        if (!r.ok) throw new Error(r.statusText); return fromFirestore(await r.json());
-      } catch (e) { console.error("fbUpdate:", e); return null; }
+      const mask = Object.keys(data).filter(function(k){return k!=="id";}).map(function(k){return "updateMask.fieldPaths="+k;}).join("&");
+      const r = await fetch(FB+"/"+col+"/"+docId+"?"+mask+"&key="+API_KEY, { method: "PATCH", headers: {"Content-Type":"application/json"}, body: JSON.stringify(toFirestore(data)) });
+      if (!r.ok) {
+        var errText = await r.text().catch(function() { return r.statusText; });
+        throw new Error("Erro ao atualizar: " + errText);
+      }
+      return fromFirestore(await r.json());
     }
     async function fbDelete(col, docId) {
-      try { await fetch(FB+"/"+col+"/"+docId+"?key="+API_KEY, { method: "DELETE" }); return true; }
-      catch (e) { console.error("fbDelete:", e); return false; }
+      const r = await fetch(FB+"/"+col+"/"+docId+"?key="+API_KEY, { method: "DELETE" });
+      if (!r.ok) {
+        var errText = await r.text().catch(function() { return r.statusText; });
+        throw new Error("Erro ao deletar: " + errText);
+      }
+      return true;
     }
     async function fbGet(col, docId) {
       try { const r = await fetch(FB+"/"+col+"/"+docId+"?key="+API_KEY); if (!r.ok) return null; return fromFirestore(await r.json()); }
@@ -206,7 +223,7 @@
     }
 
     // ═══════════════════ EMPLOYEE PUNCH PAGE ═══════════════════
-    function EmployeePage({goAdmin,employees,records,refreshRecords}) {
+    function EmployeePage({goAdmin,employees,records,refreshRecords,addRecord}) {
       const [selId,setSelId]=useState(""); const [pw,setPw]=useState(""); const [auth,setAuth]=useState(false);
       const [busy,setBusy]=useState(false); const [toast,setToast]=useState(null);
       const active=employees.filter(function(e){return e.active!=="false"&&e.active!==false;});
@@ -222,14 +239,19 @@
       }
       async function punch(type){
         if(busy) return; setBusy(true);
-        const now=new Date().toISOString();
-        const last=todayRecs[todayRecs.length-1];
-        if(last&&(Date.now()-new Date(last.timestamp).getTime())<60000){setBusy(false);return setToast({msg:"Aguarde 1 minuto",type:"error"});}
+        var now=new Date().toISOString();
+        var last=todayRecs[todayRecs.length-1];
+        if(last&&(Date.now()-new Date(last.timestamp).getTime())<5000){setBusy(false);return setToast({msg:"Aguarde alguns segundos entre registros",type:"error"});}
         if(type==="entrada"&&last&&last.type==="entrada"){setBusy(false);return setToast({msg:"Registre a saída primeiro!",type:"error"});}
         if(type==="saida"&&(!last||last.type==="saida")){setBusy(false);return setToast({msg:"Registre a entrada primeiro!",type:"error"});}
-        await fbCreate("timeRecords",{employeeId:selId,type:type,timestamp:now});
-        await refreshRecords();
-        setToast({msg:type==="entrada"?"✓ Entrada registrada!":"✓ Saída registrada!",type:"success"});
+        try {
+          var saved=await fbCreate("timeRecords",{employeeId:selId,type:type,timestamp:now});
+          addRecord(saved);
+          setToast({msg:type==="entrada"?"✓ Entrada registrada!":"✓ Saída registrada!",type:"success"});
+        } catch(e) {
+          console.error("Erro ao registrar ponto:",e);
+          setToast({msg:"Erro ao salvar registro. Tente novamente.",type:"error"});
+        }
         setBusy(false);
       }
       function logout(){setAuth(false);setSelId("");setPw("");}
@@ -352,34 +374,44 @@
         if(!form.name.trim()) return setToast({msg:"Nome obrigatório",type:"error"});
         if(!form.password.trim()) return setToast({msg:"Senha obrigatória",type:"error"});
         setSavingEmp(true);
-        if(editing){
-          await fbUpdate("employees",editing.id,{name:form.name,password:form.password,cargo:form.cargo});
-          setToast({msg:"Atualizado!",type:"success"});
-        }else{
-          await fbCreate("employees",{name:form.name,password:form.password,cargo:form.cargo,active:"true",createdAt:new Date().toISOString()});
-          setToast({msg:"Cadastrado!",type:"success"});
-        }
-        await refreshAll(); setEditing(null); setForm({name:"",password:"",cargo:""}); setSavingEmp(false);
+        try{
+          if(editing){
+            await fbUpdate("employees",editing.id,{name:form.name,password:form.password,cargo:form.cargo});
+            setToast({msg:"Atualizado!",type:"success"});
+          }else{
+            await fbCreate("employees",{name:form.name,password:form.password,cargo:form.cargo,active:"true",createdAt:new Date().toISOString()});
+            setToast({msg:"Cadastrado!",type:"success"});
+          }
+          await refreshAll(); setEditing(null); setForm({name:"",password:"",cargo:""});
+        }catch(e){console.error("saveEmp:",e);setToast({msg:"Erro ao salvar funcionário. Tente novamente.",type:"error"});}
+        setSavingEmp(false);
       }
       async function toggleEmp(emp){
-        const na=(emp.active==="false"||emp.active===false)?"true":"false";
-        await fbUpdate("employees",emp.id,{active:na}); await refreshAll();
-        setToast({msg:na==="true"?"Reativado!":"Desativado!",type:"info"});
+        var na=(emp.active==="false"||emp.active===false)?"true":"false";
+        try{
+          await fbUpdate("employees",emp.id,{active:na}); await refreshAll();
+          setToast({msg:na==="true"?"Reativado!":"Desativado!",type:"info"});
+        }catch(e){console.error("toggleEmp:",e);setToast({msg:"Erro ao alterar status. Tente novamente.",type:"error"});}
       }
       async function deleteEmp(emp){
         if(!confirm('Remover "'+emp.name+'" permanentemente?')) return;
-        const empRecs=records.filter(function(r){return r.employeeId===emp.id;});
-        for(const r of empRecs) await fbDelete("timeRecords",r.id);
-        await fbDelete("employees",emp.id); await refreshAll();
-        setToast({msg:"Removido",type:"success"});
+        try{
+          var empRecs=records.filter(function(r){return r.employeeId===emp.id;});
+          for(var i=0;i<empRecs.length;i++) await fbDelete("timeRecords",empRecs[i].id);
+          await fbDelete("employees",emp.id); await refreshAll();
+          setToast({msg:"Removido",type:"success"});
+        }catch(e){console.error("deleteEmp:",e);setToast({msg:"Erro ao remover. Tente novamente.",type:"error"});}
       }
 
       // ═══ RECORD MANAGEMENT ═══
       async function deleteRecord(rec){
         if(!confirm("Excluir este registro de "+rec.type+" ("+fmtTime(rec.timestamp)+")?")) return;
         setActionBusy(true);
-        await fbDelete("timeRecords",rec.id); await refreshAll();
-        setToast({msg:"Registro excluído!",type:"success"}); setActionBusy(false);
+        try{
+          await fbDelete("timeRecords",rec.id); await refreshAll();
+          setToast({msg:"Registro excluído!",type:"success"});
+        }catch(e){console.error("deleteRecord:",e);setToast({msg:"Erro ao excluir registro.",type:"error"});}
+        setActionBusy(false);
       }
 
       function openEditModal(rec){
@@ -394,11 +426,14 @@
       async function saveEditRecord(){
         if(!editModal) return;
         setActionBusy(true);
-        const newTimestamp=new Date(editModal.newDate+"T"+editModal.newTime+":00").toISOString();
-        await fbUpdate("timeRecords",editModal.record.id,{timestamp:newTimestamp});
-        await refreshAll();
-        setEditModal(null); setActionBusy(false);
-        setToast({msg:"Registro atualizado!",type:"success"});
+        try{
+          var newTimestamp=new Date(editModal.newDate+"T"+editModal.newTime+":00").toISOString();
+          await fbUpdate("timeRecords",editModal.record.id,{timestamp:newTimestamp});
+          await refreshAll();
+          setEditModal(null);
+          setToast({msg:"Registro atualizado!",type:"success"});
+        }catch(e){console.error("saveEditRecord:",e);setToast({msg:"Erro ao atualizar registro.",type:"error"});}
+        setActionBusy(false);
       }
 
       function openAddModal(empId){
@@ -414,11 +449,14 @@
       async function saveAddRecord(){
         if(!addModal) return;
         setActionBusy(true);
-        const newTimestamp=new Date(addModal.date+"T"+addModal.time+":00").toISOString();
-        await fbCreate("timeRecords",{employeeId:addModal.empId,type:addModal.type,timestamp:newTimestamp});
-        await refreshAll();
-        setAddModal(null); setActionBusy(false);
-        setToast({msg:"Registro adicionado!",type:"success"});
+        try{
+          var newTimestamp=new Date(addModal.date+"T"+addModal.time+":00").toISOString();
+          await fbCreate("timeRecords",{employeeId:addModal.empId,type:addModal.type,timestamp:newTimestamp});
+          await refreshAll();
+          setAddModal(null);
+          setToast({msg:"Registro adicionado!",type:"success"});
+        }catch(e){console.error("saveAddRecord:",e);setToast({msg:"Erro ao adicionar registro.",type:"error"});}
+        setActionBusy(false);
       }
 
       // PDF & CSV
@@ -444,13 +482,36 @@
 
       // Admin pw
       async function changeAdminPw(){
-        const admin=await fbGet("settings","admin"); const stored=admin?admin.password:"admin123";
-        if(adminPw.cur!==stored) return setToast({msg:"Senha atual incorreta",type:"error"});
-        if(adminPw.next.length<4) return setToast({msg:"Mínimo 4 caracteres",type:"error"});
-        if(adminPw.next!==adminPw.confirm) return setToast({msg:"Senhas não conferem",type:"error"});
-        if(admin) await fbUpdate("settings","admin",{password:adminPw.next});
-        else await fbCreate("settings",{password:adminPw.next},"admin");
-        setAdminPw({cur:"",next:"",confirm:""}); setToast({msg:"Senha alterada!",type:"success"});
+        try{
+          var admin=await fbGet("settings","admin"); var stored=admin?admin.password:"admin123";
+          if(adminPw.cur!==stored) return setToast({msg:"Senha atual incorreta",type:"error"});
+          if(adminPw.next.length<4) return setToast({msg:"Mínimo 4 caracteres",type:"error"});
+          if(adminPw.next!==adminPw.confirm) return setToast({msg:"Senhas não conferem",type:"error"});
+          if(admin) await fbUpdate("settings","admin",{password:adminPw.next});
+          else await fbCreate("settings",{password:adminPw.next},"admin");
+          setAdminPw({cur:"",next:"",confirm:""}); setToast({msg:"Senha alterada!",type:"success"});
+        }catch(e){console.error("changeAdminPw:",e);setToast({msg:"Erro ao alterar senha. Tente novamente.",type:"error"});}
+      }
+
+      const [cleaningMonth,setCleaningMonth]=useState(false);
+      async function cleanLastMonth(){
+        var now=new Date();
+        var prevMonth=now.getMonth()===0?12:now.getMonth();
+        var prevYear=now.getMonth()===0?now.getFullYear()-1:now.getFullYear();
+        var prevLabel=String(prevMonth).padStart(2,"0")+"/"+prevYear;
+        if(!confirm("Tem certeza que deseja apagar TODOS os registros de "+prevLabel+"?\n\nEssa ação é IRREVERSÍVEL. Certifique-se de ter exportado o relatório (PDF/CSV) antes de continuar.")) return;
+        setCleaningMonth(true);
+        try{
+          var toDelete=records.filter(function(r){
+            var d=new Date(r.timestamp);
+            return d.getMonth()+1===prevMonth&&d.getFullYear()===prevYear;
+          });
+          if(toDelete.length===0){setCleaningMonth(false);return setToast({msg:"Nenhum registro encontrado em "+prevLabel,type:"info"});}
+          for(var i=0;i<toDelete.length;i++) await fbDelete("timeRecords",toDelete[i].id);
+          await refreshAll();
+          setToast({msg:toDelete.length+" registro(s) de "+prevLabel+" removido(s)!",type:"success"});
+        }catch(e){console.error("cleanLastMonth:",e);setToast({msg:"Erro ao limpar registros. Tente novamente.",type:"error"});}
+        setCleaningMonth(false);
       }
 
       const tabs=[{id:"painel",label:"📊 Painel"},{id:"funcionarios",label:"👥 Funcionários"},{id:"relatorios",label:"📋 Relatórios"},{id:"config",label:"⚙ Configurações"}];
@@ -683,6 +744,18 @@
               <div style={{marginBottom:16}}><label style={labelSt}>Confirmar</label><input type="password" value={adminPw.confirm} onChange={function(e){setAdminPw({...adminPw,confirm:e.target.value});}} style={inputSt} /></div>
               <button onClick={changeAdminPw} style={btnBlue}>Salvar</button>
             </div>
+            <div style={{...cardSt,padding:24,maxWidth:420,marginBottom:22}}>
+              <h3 style={{...h3St,margin:"0 0 10px"}}>🗑️ Limpar Registros do Mês Anterior</h3>
+              <p style={{fontSize:13,color:"var(--text-light)",lineHeight:1.6,margin:"0 0 16px"}}>
+                Remove todos os registros de ponto do mês anterior ao atual. <b>Exporte o relatório (PDF/CSV) antes de limpar.</b>
+              </p>
+              <button onClick={cleanLastMonth} disabled={cleaningMonth} style={{
+                ...btnBlue,background:cleaningMonth?"#94a3b8":"linear-gradient(135deg, #dc2626, #b91c1c)",
+                cursor:cleaningMonth?"wait":"pointer",opacity:cleaningMonth?0.7:1
+              }}>
+                {cleaningMonth?"Limpando...":"Limpar Mês Anterior"}
+              </button>
+            </div>
             <div style={{...cardSt,padding:24,maxWidth:420}}>
               <h3 style={{...h3St,margin:"0 0 10px"}}>ℹ️ Sistema</h3>
               <div style={{fontSize:13,color:"var(--text-light)",lineHeight:2}}>
@@ -709,6 +782,7 @@
         setEmployees(e);setRecords(r);
       },[]);
       const fetchRecords=useCallback(async function(){const r=await fbList("timeRecords");setRecords(r);},[]);
+      const addRecord=useCallback(function(rec){setRecords(function(prev){return prev.concat([rec]);});},[]);
 
       useEffect(function(){fetchAll().then(function(){setLoading(false);});},[fetchAll]);
 
@@ -719,7 +793,7 @@
         </div>
       </div>);
 
-      if(page==="employee") return <EmployeePage goAdmin={function(){setPage("adminLogin");}} employees={employees} records={records} refreshRecords={fetchRecords} />;
+      if(page==="employee") return <EmployeePage goAdmin={function(){setPage("adminLogin");}} employees={employees} records={records} refreshRecords={fetchRecords} addRecord={addRecord} />;
       if(page==="adminLogin") return <AdminLogin onLogin={function(){setPage("admin");}} goBack={function(){setPage("employee");}} />;
       if(page==="admin") return <AdminDashboard goBack={function(){setPage("employee");}} employees={employees} records={records} refreshAll={fetchAll} />;
       return null;
